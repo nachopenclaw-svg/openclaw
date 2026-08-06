@@ -947,82 +947,6 @@ describe("native hook relay registry", () => {
     ).toBe(false);
   });
 
-  it("accepts bootstrap generation mismatches during a bounded grace window", async () => {
-    const relay = registerNativeHookRelay({
-      provider: "codex",
-      relayId: "codex-bootstrap-stale-generation",
-      sessionId: "session-1",
-      runId: "run-1",
-      allowedEvents: ["pre_tool_use"],
-      generationMismatchGraceMs: 60_000,
-    });
-
-    await expect(
-      invokeNativeHookRelayBridge({
-        provider: "codex",
-        relayId: relay.relayId,
-        generation: "stale-generation-from-resumed-thread",
-        event: "pre_tool_use",
-        timeoutMs: 2_000,
-        rawPayload: {
-          hook_event_name: "PreToolUse",
-          tool_name: "Bash",
-          tool_input: { command: "pnpm test" },
-        },
-      }),
-    ).resolves.toEqual({ stdout: "", stderr: "", exitCode: 0 });
-    expect(getOnlyNativeHookRelayInvocation()).toMatchObject({
-      relayId: relay.relayId,
-      runId: "run-1",
-      event: "pre_tool_use",
-    });
-
-    await expect(
-      invokeNativeHookRelayBridge({
-        provider: "codex",
-        relayId: relay.relayId,
-        generation: "different-stale-generation",
-        event: "pre_tool_use",
-        timeoutMs: 2_000,
-        rawPayload: {
-          hook_event_name: "PreToolUse",
-          tool_name: "Bash",
-          tool_input: { command: "pnpm test" },
-        },
-      }),
-    ).rejects.toThrow("native hook relay bridge stale registration");
-  });
-
-  it("rejects bootstrap generation mismatches after the grace window", async () => {
-    const relay = registerNativeHookRelay({
-      provider: "codex",
-      relayId: "codex-expired-bootstrap-stale-generation",
-      sessionId: "session-1",
-      runId: "run-1",
-      allowedEvents: ["pre_tool_use"],
-      generationMismatchGraceMs: 1,
-    });
-    await new Promise((resolve) => {
-      setTimeout(resolve, 10);
-    });
-
-    await expect(
-      invokeNativeHookRelayBridge({
-        provider: "codex",
-        relayId: relay.relayId,
-        generation: "stale-generation-from-resumed-thread",
-        event: "pre_tool_use",
-        timeoutMs: 2_000,
-        rawPayload: {
-          hook_event_name: "PreToolUse",
-          tool_name: "Bash",
-          tool_input: { command: "pnpm test" },
-        },
-      }),
-    ).rejects.toThrow("native hook relay bridge stale registration");
-    expect(testing.getNativeHookRelayInvocationsForTests()).toStrictEqual([]);
-  });
-
   it("renews relay ttl without rotating the direct hook bridge", async () => {
     const relay = registerNativeHookRelay({
       provider: "codex",
@@ -3146,6 +3070,196 @@ describe("native hook relay registry", () => {
         },
       },
     ]);
+  });
+
+  it("keeps worker approval state and the bridge record across an attempt rebind", async () => {
+    const beforeToolCall = vi.fn(async () => ({
+      requireApproval: { title: "Needs approval", description: "worker command needs approval" },
+    }));
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "before_tool_call", handler: beforeToolCall }]),
+    );
+    const relay = registerNativeHookRelay({
+      provider: "codex",
+      relayId: "codex-attempt-rebind",
+      agentId: "agent-1",
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      runId: "run-1",
+    });
+    const approvalRequester = vi.fn(async () => "allow-always" as const);
+    testing.setNativeHookRelayPermissionApprovalRequesterForTests(approvalRequester);
+    const permissionRequest = (toolUseId: string) =>
+      invokeNativeHookRelay({
+        provider: "codex",
+        relayId: relay.relayId,
+        event: "permission_request",
+        rawPayload: {
+          hook_event_name: "PermissionRequest",
+          cwd: "/repo",
+          tool_name: "Bash",
+          tool_use_id: toolUseId,
+          tool_input: { command: "browserforce tabs" },
+        },
+      });
+
+    await invokeNativeHookRelay({
+      provider: "codex",
+      relayId: relay.relayId,
+      event: "pre_tool_use",
+      rawPayload: {
+        hook_event_name: "PreToolUse",
+        openclaw_approval_mode: "report",
+        cwd: "/repo",
+        tool_name: "exec_command",
+        tool_use_id: "worker-parked-approval",
+        tool_input: { cmd: "cat /tmp/private_key" },
+      },
+    });
+    await permissionRequest("worker-permission-1");
+    const registrationBeforeRebind = testing.getNativeHookRelayRegistrationForTests(relay.relayId);
+
+    const nextAttempt = new AbortController();
+    expect(relay.rebindAttempt?.({ runId: "run-2", signal: nextAttempt.signal })).toBe(true);
+
+    const registration = testing.getNativeHookRelayRegistrationForTests(relay.relayId);
+    expect(registration).toBe(registrationBeforeRebind);
+    expect(registration?.runId).toBe("run-2");
+    expect(registration?.signal).toBe(nextAttempt.signal);
+
+    testing.setNativeHookRelayDeferredToolApprovalRequesterForTests(async () => ({
+      blocked: false,
+      params: { cmd: "cat /tmp/private_key", command: "cat /tmp/private_key" },
+      approvalResolution: "allow-once",
+    }));
+    await expect(
+      resolveNativeHookRelayDeferredToolApproval({
+        relayId: relay.relayId,
+        toolUseId: "worker-parked-approval",
+      }),
+    ).resolves.toEqual({ handled: true, outcome: "approved-once" });
+
+    const reused = await permissionRequest("worker-permission-2");
+    expect(approvalRequester).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(reused.stdout)).toMatchObject({
+      hookSpecificOutput: { decision: { behavior: "allow" } },
+    });
+  });
+
+  it("keeps a post-tool hook on the attempt that started it across a rebind", async () => {
+    const afterToolCall = vi.fn();
+    const middlewareContexts: Record<string, unknown>[] = [];
+    let releaseMiddleware!: () => void;
+    const middlewareGate = new Promise<void>((resolve) => {
+      releaseMiddleware = resolve;
+    });
+    const registry = createMockPluginRegistry([
+      { hookName: "after_tool_call", handler: afterToolCall },
+    ]);
+    const middleware = async (_event: unknown, ctx: Record<string, unknown>) => {
+      middlewareContexts.push(ctx);
+      await middlewareGate;
+    };
+    registry.agentToolResultMiddlewares.push({
+      pluginId: "rebind-gate",
+      rawHandler: middleware,
+      handler: middleware,
+      runtimes: ["codex"],
+      source: "test",
+    });
+    initializeGlobalHookRunner(registry);
+    setActivePluginRegistry(registry);
+    const relay = registerNativeHookRelay({
+      provider: "codex",
+      relayId: "codex-post-tool-rebind",
+      agentId: "agent-1",
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      runId: "run-1",
+      channelId: "telegram",
+      allowedEvents: ["post_tool_use"],
+    });
+    const postToolUse = (toolUseId: string) =>
+      invokeNativeHookRelay({
+        provider: "codex",
+        relayId: relay.relayId,
+        event: "post_tool_use",
+        rawPayload: {
+          hook_event_name: "PostToolUse",
+          tool_name: "Bash",
+          tool_use_id: toolUseId,
+          tool_input: { command: "pnpm test" },
+          tool_response: { output: "ok" },
+        },
+      });
+
+    const inFlight = postToolUse("worker-call-1");
+    relay.rebindAttempt?.({ runId: "run-2", channelId: "discord" });
+    releaseMiddleware();
+    await inFlight;
+
+    expect(middlewareContexts[0]).toMatchObject({ runId: "run-1" });
+    expectRecordFields(getMockCallArg(afterToolCall, 0, 0, "after tool call event"), {
+      runId: "run-1",
+      toolCallId: "worker-call-1",
+    });
+    expectRecordFields(getMockCallArg(afterToolCall, 0, 1, "after tool call context"), {
+      runId: "run-1",
+      channelId: "telegram",
+    });
+
+    await postToolUse("worker-call-2");
+    expect(middlewareContexts[1]).toMatchObject({ runId: "run-2" });
+    expectRecordFields(getMockCallArg(afterToolCall, 1, 1, "adopted after tool call context"), {
+      runId: "run-2",
+      channelId: "discord",
+    });
+  });
+
+  it("keeps a pre-tool failure on the attempt that started it across a rebind", async () => {
+    let releaseBeforeToolCall!: () => void;
+    const beforeToolCallGate = new Promise<void>((resolve) => {
+      releaseBeforeToolCall = resolve;
+    });
+    const beforeToolCall = vi.fn(async () => {
+      await beforeToolCallGate;
+      throw new Error("hook crashed");
+    });
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "before_tool_call", handler: beforeToolCall }]),
+    );
+    const startingAttemptFailures = vi.fn();
+    const adoptingAttemptFailures = vi.fn();
+    const relay = registerNativeHookRelay({
+      provider: "codex",
+      relayId: "codex-pre-tool-rebind",
+      sessionId: "session-1",
+      runId: "run-1",
+      onPreToolUseFailure: startingAttemptFailures,
+    });
+
+    const inFlight = invokeNativeHookRelay({
+      provider: "codex",
+      relayId: relay.relayId,
+      event: "pre_tool_use",
+      rawPayload: {
+        hook_event_name: "PreToolUse",
+        tool_name: "exec_command",
+        tool_use_id: "worker-denied-mid-rebind",
+        tool_input: { cmd: "pnpm test" },
+      },
+    });
+    relay.rebindAttempt?.({ runId: "run-2", onPreToolUseFailure: adoptingAttemptFailures });
+    releaseBeforeToolCall();
+
+    await expect(inFlight).resolves.toMatchObject({ failureDisposition: "failed" });
+    expect(startingAttemptFailures).toHaveBeenCalledWith({
+      toolName: "exec",
+      toolCallId: "worker-denied-mid-rebind",
+      disposition: "failed",
+      durationMs: expect.any(Number),
+    });
+    expect(adoptingAttemptFailures).not.toHaveBeenCalled();
   });
 
   it("does not reuse allow-always PermissionRequest approvals across sessions with the same relay id", async () => {

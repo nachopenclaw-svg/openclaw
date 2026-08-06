@@ -69,8 +69,6 @@ export type NativeHookRelayProcessResponse = {
 export type NativeHookRelayRegistration = {
   relayId: string;
   provider: NativeHookRelayProvider;
-  generationMismatchGraceExpiresAtMs?: number;
-  generationMismatchGraceAcceptedGeneration?: string;
   agentId?: string;
   sessionId: string;
   sessionKey?: string;
@@ -90,6 +88,19 @@ export type NativeHookRelayRegistration = {
   }) => void | Promise<void>;
 };
 
+export type NativeHookRelayAttemptBinding = Pick<
+  RegisterNativeHookRelayParams,
+  | "runId"
+  | "config"
+  | "channelId"
+  | "requester"
+  | "approvalContext"
+  | "signal"
+  | "onPreToolUseFailure"
+>;
+
+export type NativeHookRelayInvocationBinding = Readonly<NativeHookRelayRegistration>;
+
 export type NativeHookRelayRegistrationHandle = NativeHookRelayRegistration & {
   generation?: string;
   shouldRelayEvent: (event: NativeHookRelayEvent) => boolean;
@@ -99,6 +110,7 @@ export type NativeHookRelayRegistrationHandle = NativeHookRelayRegistration & {
     options?: NativeHookRelayCommandForEventOptions,
   ) => string;
   renew: (ttlMs?: number) => void;
+  rebindAttempt?: (binding: NativeHookRelayAttemptBinding) => boolean;
   unregister: () => void;
 };
 
@@ -106,7 +118,6 @@ export type RegisterNativeHookRelayParams = {
   provider: NativeHookRelayProvider;
   relayId?: string;
   generation?: string;
-  generationMismatchGraceMs?: number;
   agentId?: string;
   sessionId: string;
   sessionKey?: string;

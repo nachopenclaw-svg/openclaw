@@ -452,6 +452,7 @@ function createRelay(options?: {
           : ""
       }${commandOptions?.timeoutMs ? ` --timeout ${commandOptions.timeoutMs}` : ""}`,
     renew: () => undefined,
+    rebindAttempt: () => true,
     unregister: () => undefined,
   };
 }

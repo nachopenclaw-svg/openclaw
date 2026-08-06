@@ -2,8 +2,9 @@
  * Bridges Codex native hook callbacks into OpenClaw's native hook relay so
  * app-server tool events can still run OpenClaw policy and diagnostics.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  embeddedAgentLog,
   registerNativeHookRelay,
   type BeforeToolCallFailureDisposition,
   type EmbeddedRunAttemptParams,
@@ -18,7 +19,10 @@ import {
 import type { PluginHookToolContext } from "openclaw/plugin-sdk/types";
 import type { CodexAppServerRuntimeOptions } from "./config.js";
 import { resolveCodexToolAbortTerminalReason } from "./dynamic-tool-execution.js";
-import { nativeHookRelayUnregisterQueue } from "./native-hook-relay-state.js";
+import {
+  codexNativeHookRelayOwners as codexNativeHookRelayOwnerRegistry,
+  nativeHookRelayUnregisterQueue,
+} from "./native-hook-relay-state.js";
 import type { JsonObject, JsonValue } from "./protocol.js";
 
 /** Codex hook events that can be registered through OpenClaw's native relay. */
@@ -57,11 +61,47 @@ export type CodexNativePreToolUseFailure = {
   durationMs: number;
 };
 
+export type CodexNativeHookRelayLease = Omit<
+  NativeHookRelayRegistrationHandle,
+  "unregister" | "rebindAttempt"
+> & {
+  acquireChild: (childThreadId: string) => (() => void) | undefined;
+  releaseParent: (options?: { delay?: boolean }) => void;
+};
+
+type CodexNativeHookRelayParams = {
+  options:
+    | {
+        enabled?: boolean;
+        ttlMs?: number;
+        gatewayTimeoutMs?: number;
+        hookTimeoutSec?: number;
+      }
+    | undefined;
+  generation?: string;
+  events: readonly NativeHookRelayEvent[];
+  agentId: string | undefined;
+  sessionId: string;
+  sessionKey: string | undefined;
+  config: EmbeddedRunAttemptParams["config"];
+  runId: string;
+  channelId?: string;
+  requester?: NonNullable<PluginHookToolContext["requester"]>;
+  approvalContext?: Parameters<typeof registerNativeHookRelay>[0]["approvalContext"];
+  attemptTimeoutMs: number;
+  startupTimeoutMs: number;
+  turnStartTimeoutMs: number;
+  loopDetectionPreToolUseRelay: boolean;
+  signal: AbortSignal;
+  onPreToolUseFailure: (failure: CodexNativePreToolUseFailure) => void | Promise<void>;
+};
+
 /** Defers relay unregister so late native hook subprocesses can still resolve. */
-export function scheduleCodexNativeHookRelayUnregister(params: {
-  relay: NativeHookRelayRegistrationHandle;
+function scheduleCodexNativeHookRelayUnregister(params: {
+  relay: Pick<NativeHookRelayRegistrationHandle, "unregister">;
   hookTimeoutSec?: number;
-}): void {
+  beforeUnregister?: () => void;
+}): () => void {
   let pending: { timeout: ReturnType<typeof setTimeout>; unregister: () => void } | undefined;
   const unregister = () => {
     if (!pending) {
@@ -72,6 +112,7 @@ export function scheduleCodexNativeHookRelayUnregister(params: {
     if (!nativeHookRelayUnregisterQueue.delete(current)) {
       return;
     }
+    params.beforeUnregister?.();
     params.relay.unregister();
   };
   const timeout = setTimeout(
@@ -81,6 +122,16 @@ export function scheduleCodexNativeHookRelayUnregister(params: {
   pending = { timeout, unregister };
   nativeHookRelayUnregisterQueue.add(pending);
   timeout.unref();
+  return () => {
+    if (!pending) {
+      return;
+    }
+    const current = pending;
+    pending = undefined;
+    if (nativeHookRelayUnregisterQueue.delete(current)) {
+      clearTimeout(current.timeout);
+    }
+  };
 }
 
 /** Computes the delayed unregister window from Codex's hook timeout. */
@@ -125,65 +176,51 @@ export function emitCodexNativePreToolUseFailureDiagnostic(params: {
   });
 }
 
-/** Registers an OpenClaw native hook relay for a Codex app-server turn. */
-export function createCodexNativeHookRelay(params: {
-  options:
-    | {
-        enabled?: boolean;
-        ttlMs?: number;
-        gatewayTimeoutMs?: number;
-      }
-    | undefined;
-  generation?: string;
-  generationMismatchGraceMs?: number;
-  events: readonly NativeHookRelayEvent[];
-  agentId: string | undefined;
-  sessionId: string;
-  sessionKey: string | undefined;
-  config: EmbeddedRunAttemptParams["config"];
-  runId: string;
-  channelId?: string;
-  requester?: NonNullable<PluginHookToolContext["requester"]>;
-  approvalContext?: Parameters<typeof registerNativeHookRelay>[0]["approvalContext"];
-  attemptTimeoutMs: number;
-  startupTimeoutMs: number;
-  turnStartTimeoutMs: number;
-  loopDetectionPreToolUseRelay: boolean;
-  signal: AbortSignal;
-  onPreToolUseFailure: (failure: CodexNativePreToolUseFailure) => void | Promise<void>;
-}): NativeHookRelayRegistrationHandle | undefined {
+export function createCodexNativeHookRelay(
+  params: CodexNativeHookRelayParams,
+): CodexNativeHookRelayLease | undefined {
   if (params.options?.enabled === false) {
     return undefined;
   }
+  const generation = params.generation?.trim() || randomUUID();
+  const attempt: CodexNativeHookRelayAttempt = { ...params, generation };
+  const relayId = buildCodexNativeHookRelayId({
+    agentId: params.agentId,
+    sessionId: params.sessionId,
+    sessionKey: params.sessionKey,
+    generation,
+  });
+  const adoptedLease = codexNativeHookRelayOwners.get(relayId)?.adoptAttempt(attempt);
+  if (adoptedLease) {
+    return adoptedLease;
+  }
+  return new CodexNativeHookRelayRoute(attempt, relayId).handle;
+}
+
+function registerCodexNativeHookRelay(
+  params: CodexNativeHookRelayAttempt,
+  relayId: string,
+  options: {
+    ttlMs: number;
+    signal: AbortSignal;
+    onPreToolUseFailure: CodexNativeHookRelayParams["onPreToolUseFailure"];
+    allowedEvents?: readonly NativeHookRelayEvent[];
+    preToolUseLoopDetection?: boolean;
+  },
+): NativeHookRelayRegistrationHandle {
   return registerNativeHookRelay({
     provider: "codex",
-    relayId: buildCodexNativeHookRelayId({
-      agentId: params.agentId,
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-    }),
-    ...(params.generation ? { generation: params.generation } : {}),
-    ...(params.generationMismatchGraceMs
-      ? { generationMismatchGraceMs: params.generationMismatchGraceMs }
-      : {}),
+    relayId,
+    generation: params.generation,
     ...(params.agentId ? { agentId: params.agentId } : {}),
     sessionId: params.sessionId,
     ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
-    ...(params.config ? { config: params.config } : {}),
-    runId: params.runId,
-    ...(params.channelId ? { channelId: params.channelId } : {}),
-    ...(params.requester ? { requester: params.requester } : {}),
-    ...(params.approvalContext ? { approvalContext: params.approvalContext } : {}),
-    allowedEvents: params.events,
-    preToolUseLoopDetection: params.loopDetectionPreToolUseRelay,
-    ttlMs: resolveCodexNativeHookRelayTtlMs({
-      explicitTtlMs: params.options?.ttlMs,
-      attemptTimeoutMs: params.attemptTimeoutMs,
-      startupTimeoutMs: params.startupTimeoutMs,
-      turnStartTimeoutMs: params.turnStartTimeoutMs,
-    }),
-    signal: params.signal,
-    onPreToolUseFailure: params.onPreToolUseFailure,
+    ...codexNativeHookRelayAttemptBinding(params),
+    allowedEvents: options.allowedEvents ?? params.events,
+    preToolUseLoopDetection: options.preToolUseLoopDetection ?? params.loopDetectionPreToolUseRelay,
+    ttlMs: options.ttlMs,
+    signal: options.signal,
+    onPreToolUseFailure: options.onPreToolUseFailure,
     command: {
       // Hook relay subprocesses are observational for most tool events; keep
       // them lower priority so they do not compete with the active reply turn.
@@ -192,6 +229,292 @@ export function createCodexNativeHookRelay(params: {
     },
   });
 }
+
+type CodexNativeHookRelayAttempt = CodexNativeHookRelayParams & { generation: string };
+
+type CodexNativeHookRelayAttemptClaim = {
+  readonly attempt: CodexNativeHookRelayAttempt;
+  detachAbort: () => void;
+};
+
+function codexNativeHookRelayAttemptBinding(attempt: CodexNativeHookRelayAttempt) {
+  return {
+    runId: attempt.runId,
+    ...(attempt.config ? { config: attempt.config } : {}),
+    ...(attempt.channelId ? { channelId: attempt.channelId } : {}),
+    ...(attempt.requester ? { requester: attempt.requester } : {}),
+    ...(attempt.approvalContext ? { approvalContext: attempt.approvalContext } : {}),
+  };
+}
+
+function resolveCodexNativeHookRelayAttemptTtlMs(attempt: CodexNativeHookRelayAttempt): number {
+  return resolveCodexNativeHookRelayTtlMs({
+    explicitTtlMs: attempt.options?.ttlMs,
+    attemptTimeoutMs: attempt.attemptTimeoutMs,
+    startupTimeoutMs: attempt.startupTimeoutMs,
+    turnStartTimeoutMs: attempt.turnStartTimeoutMs,
+  });
+}
+
+class CodexNativeHookRelayRoute {
+  readonly handle: CodexNativeHookRelayLease;
+
+  private readonly childThreadIds = new Set<string>();
+  private readonly relayId: string;
+  private relay: NativeHookRelayRegistrationHandle;
+  private readonly lifetimeAbortController = new AbortController();
+  private attemptClaim: CodexNativeHookRelayAttemptClaim | undefined;
+  private ttlMs: number;
+  private hookTimeoutSec: number | undefined;
+  private readonly frozenPreToolUseLoopDetection: boolean;
+  private renewalTimer: ReturnType<typeof setTimeout> | undefined;
+  private cancelPendingUnregister: (() => void) | undefined;
+  private released = false;
+
+  constructor(attempt: CodexNativeHookRelayAttempt, relayId: string) {
+    this.relayId = relayId;
+    this.ttlMs = resolveCodexNativeHookRelayAttemptTtlMs(attempt);
+    this.hookTimeoutSec = attempt.options?.hookTimeoutSec;
+    this.frozenPreToolUseLoopDetection = attempt.loopDetectionPreToolUseRelay;
+    this.relay = registerCodexNativeHookRelay(attempt, relayId, {
+      ttlMs: this.ttlMs,
+      signal: this.lifetimeAbortController.signal,
+      onPreToolUseFailure: (failure) =>
+        this.reportUnclaimedPreToolUseFailure(attempt.runId, failure),
+    });
+    codexNativeHookRelayOwners.set(relayId, this);
+    this.handle = this.bindAttempt(attempt);
+    embeddedAgentLog.debug("Codex native hook relay route registered", {
+      relayId,
+      generation: attempt.generation,
+      runId: attempt.runId,
+    });
+  }
+
+  adoptAttempt(attempt: CodexNativeHookRelayAttempt): CodexNativeHookRelayLease | undefined {
+    if (this.released) {
+      return undefined;
+    }
+    this.cancelPendingUnregister?.();
+    this.cancelPendingUnregister = undefined;
+    this.retireAttemptClaim();
+    const lease = this.bindAttempt(attempt);
+    embeddedAgentLog.debug("Codex native hook relay attempt adopted", {
+      relayId: this.relayId,
+      runId: attempt.runId,
+      childCount: this.childThreadIds.size,
+    });
+    this.renew(this.ttlMs);
+    return lease;
+  }
+
+  private bindAttempt(attempt: CodexNativeHookRelayAttempt): CodexNativeHookRelayLease {
+    this.ttlMs = resolveCodexNativeHookRelayAttemptTtlMs(attempt);
+    this.hookTimeoutSec = attempt.options?.hookTimeoutSec;
+    const claim: CodexNativeHookRelayAttemptClaim = { attempt, detachAbort: () => undefined };
+    this.attemptClaim = claim;
+    const binding = {
+      ...codexNativeHookRelayAttemptBinding(attempt),
+      signal: AbortSignal.any([this.lifetimeAbortController.signal, attempt.signal]),
+      onPreToolUseFailure: attempt.onPreToolUseFailure,
+    };
+    if (!this.relay.rebindAttempt?.(binding)) {
+      embeddedAgentLog.debug("Codex native hook relay registration re-registered", {
+        relayId: this.relayId,
+        runId: attempt.runId,
+      });
+      this.relay = registerCodexNativeHookRelay(attempt, this.relayId, {
+        ttlMs: this.ttlMs,
+        signal: this.lifetimeAbortController.signal,
+        onPreToolUseFailure: (failure) =>
+          this.reportUnclaimedPreToolUseFailure(attempt.runId, failure),
+        allowedEvents: this.relay.allowedEvents,
+        preToolUseLoopDetection: this.frozenPreToolUseLoopDetection,
+      });
+      this.relay.rebindAttempt?.(binding);
+    }
+    this.attachAttemptAbort(claim);
+    const relay = this.relay;
+    const { unregister: _unregister, rebindAttempt: _rebindAttempt, ...fields } = relay;
+    return {
+      ...fields,
+      get expiresAtMs() {
+        return relay.expiresAtMs;
+      },
+      renew: (ttlMs?: number) => this.renew(ttlMs),
+      acquireChild: (childThreadId: string) => this.acquireChild(childThreadId),
+      releaseParent: (options?: { delay?: boolean }) => this.releaseAttempt(claim, options),
+    };
+  }
+
+  private reportUnclaimedPreToolUseFailure(runId: string, failure: CodexNativePreToolUseFailure) {
+    emitCodexNativePreToolUseFailureDiagnostic({
+      agentId: this.relay.agentId,
+      sessionId: this.relay.sessionId,
+      sessionKey: this.relay.sessionKey,
+      runId,
+      failure,
+    });
+  }
+
+  private attachAttemptAbort(claim: CodexNativeHookRelayAttemptClaim): void {
+    const { signal } = claim.attempt;
+    const onAbort = () => this.releaseAttempt(claim);
+    signal.addEventListener("abort", onAbort, { once: true });
+    claim.detachAbort = () => signal.removeEventListener("abort", onAbort);
+    if (signal.aborted) {
+      onAbort();
+    }
+  }
+
+  private hasClaims(): boolean {
+    return this.attemptClaim !== undefined || this.childThreadIds.size > 0;
+  }
+
+  private renew(ttlMs?: number): void {
+    if (this.released || !this.hasClaims()) {
+      return;
+    }
+    this.relay.renew(ttlMs);
+  }
+
+  private acquireChild(childThreadIdInput: string): (() => void) | undefined {
+    const childThreadId = childThreadIdInput.trim();
+    if (!childThreadId || this.released || this.childThreadIds.has(childThreadId)) {
+      return undefined;
+    }
+    this.cancelPendingUnregister?.();
+    this.cancelPendingUnregister = undefined;
+    this.childThreadIds.add(childThreadId);
+    this.scheduleRenewal();
+    let acquired = true;
+    return () => {
+      if (!acquired) {
+        return;
+      }
+      acquired = false;
+      this.childThreadIds.delete(childThreadId);
+      if (this.childThreadIds.size === 0) {
+        this.clearRenewal();
+        if (!this.attemptClaim) {
+          this.requestFinalRelease(true);
+        }
+      }
+    };
+  }
+
+  private releaseAttempt(
+    claim: CodexNativeHookRelayAttemptClaim,
+    options: { delay?: boolean } = {},
+  ): void {
+    if (this.released || this.attemptClaim !== claim) {
+      return;
+    }
+    this.retireAttemptClaim();
+    if (this.childThreadIds.size === 0) {
+      this.requestFinalRelease(options.delay === true);
+    }
+  }
+
+  private retireAttemptClaim(): void {
+    const claim = this.attemptClaim;
+    if (!claim) {
+      return;
+    }
+    this.attemptClaim = undefined;
+    claim.detachAbort();
+    this.relay.rebindAttempt?.({
+      ...codexNativeHookRelayAttemptBinding(claim.attempt),
+      signal: this.lifetimeAbortController.signal,
+      onPreToolUseFailure: (failure) =>
+        this.reportUnclaimedPreToolUseFailure(claim.attempt.runId, failure),
+    });
+  }
+
+  private requestFinalRelease(delay: boolean): void {
+    if (this.released || this.hasClaims()) {
+      return;
+    }
+    if (!delay) {
+      this.releaseNow("codex_native_hook_relay_released");
+      return;
+    }
+    if (this.cancelPendingUnregister) {
+      return;
+    }
+    this.cancelPendingUnregister = scheduleCodexNativeHookRelayUnregister({
+      relay: { unregister: () => this.relay.unregister() },
+      hookTimeoutSec: this.hookTimeoutSec,
+      beforeUnregister: () => {
+        this.cancelPendingUnregister = undefined;
+        this.lifetimeAbortController.abort("codex_native_hook_relay_released");
+        this.finalizeState("codex_native_hook_relay_released_delayed");
+      },
+    });
+  }
+
+  private scheduleRenewal(): void {
+    if (this.renewalTimer || this.released || this.childThreadIds.size === 0) {
+      return;
+    }
+    const delayMs = Math.max(1, Math.min(5 * 60_000, Math.floor(this.ttlMs / 2)));
+    this.renewalTimer = setTimeout(() => {
+      this.renewalTimer = undefined;
+      if (this.released || this.childThreadIds.size === 0) {
+        return;
+      }
+      this.renew(this.ttlMs);
+      this.scheduleRenewal();
+    }, delayMs);
+    this.renewalTimer.unref();
+  }
+
+  private clearRenewal(): void {
+    if (!this.renewalTimer) {
+      return;
+    }
+    clearTimeout(this.renewalTimer);
+    this.renewalTimer = undefined;
+  }
+
+  private releaseNow(reason: string): void {
+    this.cancelPendingUnregister?.();
+    this.cancelPendingUnregister = undefined;
+    this.lifetimeAbortController.abort(reason);
+    this.relay.unregister();
+    this.finalizeState(reason);
+  }
+
+  private finalizeState(reason: string): void {
+    if (this.released) {
+      return;
+    }
+    this.released = true;
+    embeddedAgentLog.debug("Codex native hook relay route released", {
+      relayId: this.relayId,
+      reason,
+    });
+    this.clearRenewal();
+    this.attemptClaim?.detachAbort();
+    this.attemptClaim = undefined;
+    this.childThreadIds.clear();
+    if (codexNativeHookRelayOwners.get(this.relayId) === this) {
+      codexNativeHookRelayOwners.delete(this.relayId);
+    }
+  }
+
+  dispose(): void {
+    if (this.released) {
+      return;
+    }
+    this.releaseNow("codex_native_hook_relay_disposed");
+  }
+}
+
+const codexNativeHookRelayOwners = codexNativeHookRelayOwnerRegistry as Map<
+  string,
+  CodexNativeHookRelayRoute
+>;
 
 /** Selects the native hook events Codex should install for the current approval mode. */
 export function resolveCodexNativeHookRelayEvents(params: {
@@ -228,18 +551,20 @@ export function resolveCodexNativeHookRelayTtlMs(params: {
   return Math.max(CODEX_NATIVE_HOOK_RELAY_MIN_TTL_MS, Math.floor(relayBudgetMs));
 }
 
-/** Builds a stable relay id scoped to the agent and session identity. */
 function buildCodexNativeHookRelayId(params: {
   agentId: string | undefined;
   sessionId: string;
   sessionKey: string | undefined;
+  generation: string;
 }): string {
   const hash = createHash("sha256");
-  hash.update("openclaw:codex:native-hook-relay:v1");
+  hash.update("openclaw:codex:native-hook-relay:v2");
   hash.update("\0");
   hash.update(params.agentId?.trim() || "");
   hash.update("\0");
   hash.update(params.sessionKey?.trim() || params.sessionId);
+  hash.update("\0");
+  hash.update(params.generation);
   return `codex-${hash.digest("hex").slice(0, 40)}`;
 }
 
@@ -264,7 +589,10 @@ const CODEX_SESSION_FLAGS_HOOK_SOURCE_PATHS = [
 
 /** Builds the Codex config overlay that installs trusted command hooks for relay events. */
 export function buildCodexNativeHookRelayConfig(params: {
-  relay: NativeHookRelayRegistrationHandle;
+  relay: Pick<
+    NativeHookRelayRegistrationHandle,
+    "shouldRelayEvent" | "toolMatcherForEvent" | "commandForEvent"
+  >;
   events?: readonly NativeHookRelayEvent[];
   hookTimeoutSec?: number;
   clearOmittedEvents?: boolean;

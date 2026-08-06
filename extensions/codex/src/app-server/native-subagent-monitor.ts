@@ -13,6 +13,7 @@ import {
 } from "openclaw/plugin-sdk/agent-harness-task-runtime";
 import { asFiniteNumber, normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { CodexAppServerClient } from "./client.js";
+import type { CodexNativeHookRelayLease } from "./native-hook-relay.js";
 import {
   codexNativeSubagentNotifications as nativeSubagentNotifications,
   type CodexNativeSubagentCompletion,
@@ -49,6 +50,7 @@ type ParentState = {
   agentId?: string;
   taskRuntime?: AgentHarnessTaskRuntime;
   mirror?: CodexNativeSubagentTaskMirror;
+  nativeHookRelay?: CodexNativeHookRelayLease;
 };
 
 type ChildState = {
@@ -67,6 +69,8 @@ type ChildState = {
   deliveringCompletion: boolean;
   deliveryOwnerKey?: string;
   settledWithoutCompletion: boolean;
+  nativeHookRelay?: CodexNativeHookRelayLease;
+  releaseNativeHookRelay?: () => void;
 };
 
 type ChildAssistantMessages = {
@@ -155,6 +159,7 @@ function registerMonitor(params: {
   runtime?: NativeSubagentMonitorRuntime;
   retainClient?: () => (() => void) | undefined;
   retainParentThread?: (threadId: string) => (() => void) | undefined;
+  nativeHookRelay?: CodexNativeHookRelayLease;
 }): { unregister: () => void } {
   let monitor = monitors.get(params.client);
   if (!monitor) {
@@ -169,6 +174,7 @@ function registerMonitor(params: {
     requesterSessionKey: params.requesterSessionKey,
     taskRuntimeScope: params.taskRuntimeScope,
     agentId: params.agentId,
+    nativeHookRelay: params.nativeHookRelay,
   });
 }
 
@@ -176,6 +182,10 @@ class Monitor {
   private readonly parentStates = new Map<string, ParentState>();
   private readonly childStates = new Map<string, ChildState>();
   private readonly childThreadIdsByAgentPath = new Map<string, string>();
+  private readonly descendantRelayClaims = new Map<
+    string,
+    { lease: CodexNativeHookRelayLease; release: () => void }
+  >();
   private readonly taskReconciliations = new Map<string, Promise<void>>();
   private readonly taskReconciliationTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly threadStatusRevisions = new Map<string, ThreadStatusRevision>();
@@ -224,6 +234,10 @@ class Monitor {
       clearTimeout(timer);
     }
     this.taskReconciliationTimers.clear();
+    for (const claim of this.descendantRelayClaims.values()) {
+      claim.release();
+    }
+    this.descendantRelayClaims.clear();
     for (const childState of this.childStates.values()) {
       // Terminal delivery no longer needs app-server. Keep its bounded retry
       // alive if idle-pool eviction closes this client between attempts.
@@ -257,6 +271,7 @@ class Monitor {
     requesterSessionKey?: string;
     taskRuntimeScope?: AgentHarnessTaskRuntimeScope;
     agentId?: string;
+    nativeHookRelay?: CodexNativeHookRelayLease;
   }): { unregister: () => void } {
     const parentThreadId = params.parentThreadId.trim();
     if (!parentThreadId) {
@@ -281,6 +296,7 @@ class Monitor {
     state.requesterSessionKey ??= params.requesterSessionKey;
     state.taskRuntimeScope ??= params.taskRuntimeScope;
     state.agentId ??= params.agentId;
+    state.nativeHookRelay = params.nativeHookRelay;
     this.prepareParentTaskRuntime(state);
     for (const childState of this.childStates.values()) {
       if (childState.parentThreadId === parentThreadId && childState.pendingCompletion) {
@@ -345,6 +361,7 @@ class Monitor {
     const threadStatus = isJsonObject(params?.status)
       ? normalizeIdentifier(readString(params.status, "type"))
       : undefined;
+    this.trackDescendantHookRelay(notification, params, threadId, threadStatus);
     const tracksRecoveryRevision = Boolean(threadId && this.threadStatusRevisions.has(threadId));
     if (
       RECOVERY_REVISION_NOTIFICATION_METHODS.has(notification.method) &&
@@ -411,6 +428,10 @@ class Monitor {
     if (childState.terminal) {
       return;
     }
+    this.attachChildNativeHookRelay(
+      childState,
+      this.parentStates.get(childState.parentThreadId)?.nativeHookRelay,
+    );
     this.observeActiveChild(childState);
     this.clearRecoveryTimers(childState);
     childState.recoveryAttempt = 0;
@@ -621,32 +642,21 @@ class Monitor {
         : undefined;
       const state = parentThreadId ? this.parentStates.get(parentThreadId) : undefined;
       if (state && parentThreadId) {
+        const spawned = readItemSpawnedThreads(notification.method, item);
         // Codex multi-agent V2 exposes the child only through this parent-scoped
         // activity item; its later wait item has no receiver thread ids.
-        if (
-          notification.method === "item/completed" &&
-          readString(item, "type") === "subAgentActivity"
-        ) {
-          const childThreadId = readString(item, "agentThreadId")?.trim();
-          const agentPath = readString(item, "agentPath");
-          if (childThreadId) {
+        if (spawned.subAgentActivity) {
+          for (const childThreadId of spawned.threadIds) {
             this.registerChildThread(
               parentThreadId,
               childThreadId,
-              agentPath === undefined ? {} : { agentPath },
+              spawned.agentPath === undefined ? {} : { agentPath: spawned.agentPath },
             );
           }
           return state;
         }
-        const isSpawnAgentTool = normalizeIdentifier(readString(item, "tool")) === "spawnagent";
-        const childThreadIds = isSpawnAgentTool
-          ? new Set([
-              ...readStringArray(item?.receiverThreadIds),
-              ...readObjectStringKeys(item?.agentsStates),
-            ])
-          : new Set(readStringArray(item?.receiverThreadIds));
         let accepted = true;
-        for (const childThreadId of childThreadIds) {
+        for (const childThreadId of spawned.threadIds) {
           accepted = Boolean(this.registerChildThread(parentThreadId, childThreadId)) && accepted;
         }
         if (!accepted) {
@@ -868,6 +878,7 @@ class Monitor {
       return;
     }
     childState.terminal = true;
+    this.releaseChildNativeHookRelay(childState);
     this.clearRecoveryTimers(childState);
     state.mirror?.markAuthoritativeCompletion(completion.childThreadId);
     state.taskRuntime?.finalizeTaskRunByRunId({
@@ -1029,6 +1040,10 @@ class Monitor {
         deliveringCompletion: false,
       };
       this.childStates.set(childThreadId, childState);
+      this.attachChildNativeHookRelay(
+        childState,
+        this.parentStates.get(parentThreadId)?.nativeHookRelay,
+      );
       this.threadStatusRevisions.set(
         childThreadId,
         this.threadStatusRevisions.get(childThreadId) ?? { value: 0, readers: 0 },
@@ -1064,6 +1079,7 @@ class Monitor {
 
   private unregisterChild(childState: ChildState): void {
     this.clearRecoveryTimers(childState);
+    this.releaseChildNativeHookRelay(childState);
     if (childState.completionDeliveryTimer) {
       clearTimeout(childState.completionDeliveryTimer);
     }
@@ -1098,6 +1114,81 @@ class Monitor {
     if (state) {
       this.pruneParentIfUnused(state);
     }
+  }
+
+  private attachChildNativeHookRelay(
+    childState: ChildState,
+    relay: CodexNativeHookRelayLease | undefined,
+  ): void {
+    if (childState.nativeHookRelay || !relay) {
+      return;
+    }
+    const release = relay.acquireChild(childState.childThreadId);
+    if (!release) {
+      return;
+    }
+    childState.nativeHookRelay = relay;
+    childState.releaseNativeHookRelay = release;
+  }
+
+  private trackDescendantHookRelay(
+    notification: CodexServerNotification,
+    params: JsonObject | undefined,
+    threadId: string | undefined,
+    threadStatus: string | undefined,
+  ): void {
+    if (notification.method === "item/started" || notification.method === "item/completed") {
+      const item = isJsonObject(params?.item) ? params.item : undefined;
+      const spawnerThreadId = (readString(item, "senderThreadId") ?? threadId)?.trim();
+      const lease = spawnerThreadId
+        ? (this.childStates.get(spawnerThreadId)?.nativeHookRelay ??
+          this.descendantRelayClaims.get(spawnerThreadId)?.lease)
+        : undefined;
+      if (!lease) {
+        return;
+      }
+      for (const spawnedThreadId of readItemSpawnedThreads(notification.method, item).threadIds) {
+        this.acquireDescendantHookRelay(spawnedThreadId, lease);
+      }
+      return;
+    }
+    if (threadId && threadStatus === "notloaded") {
+      this.releaseDescendantHookRelay(threadId);
+    }
+  }
+
+  private acquireDescendantHookRelay(
+    descendantThreadIdInput: string,
+    lease: CodexNativeHookRelayLease,
+  ): void {
+    const descendantThreadId = descendantThreadIdInput.trim();
+    if (
+      !descendantThreadId ||
+      this.disposed ||
+      this.descendantRelayClaims.has(descendantThreadId) ||
+      this.childStates.has(descendantThreadId) ||
+      this.parentStates.has(descendantThreadId)
+    ) {
+      return;
+    }
+    const release = lease.acquireChild(descendantThreadId);
+    if (!release) {
+      return;
+    }
+    this.descendantRelayClaims.set(descendantThreadId, { lease, release });
+  }
+
+  private releaseDescendantHookRelay(descendantThreadId: string): void {
+    const claim = this.descendantRelayClaims.get(descendantThreadId);
+    this.descendantRelayClaims.delete(descendantThreadId);
+    claim?.release();
+  }
+
+  private releaseChildNativeHookRelay(childState: ChildState): void {
+    const release = childState.releaseNativeHookRelay;
+    childState.nativeHookRelay = undefined;
+    childState.releaseNativeHookRelay = undefined;
+    release?.();
   }
 
   private releaseClientRetentionIfIdle(): void {
@@ -1616,6 +1707,31 @@ function isNoFinalCompletion(completion: CodexNativeSubagentCompletion): boolean
 
 function delayForAttempt(delays: readonly number[], attempt: number): number {
   return Math.max(1, delays[Math.min(attempt, delays.length - 1)] ?? 1);
+}
+
+function readItemSpawnedThreads(
+  method: string,
+  item: JsonObject | undefined,
+): { threadIds: Set<string>; agentPath?: string; subAgentActivity: boolean } {
+  if (method === "item/completed" && readString(item, "type") === "subAgentActivity") {
+    const childThreadId = readString(item, "agentThreadId")?.trim();
+    const agentPath = readString(item, "agentPath");
+    return {
+      threadIds: new Set(childThreadId ? [childThreadId] : []),
+      ...(agentPath === undefined ? {} : { agentPath }),
+      subAgentActivity: true,
+    };
+  }
+  const isSpawnAgentTool = normalizeIdentifier(readString(item, "tool")) === "spawnagent";
+  return {
+    threadIds: isSpawnAgentTool
+      ? new Set([
+          ...readStringArray(item?.receiverThreadIds),
+          ...readObjectStringKeys(item?.agentsStates),
+        ])
+      : new Set(readStringArray(item?.receiverThreadIds)),
+    subAgentActivity: false,
+  };
 }
 
 function readThreadParentThreadId(thread: JsonObject | undefined): string | undefined {
