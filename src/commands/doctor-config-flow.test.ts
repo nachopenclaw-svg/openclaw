@@ -3375,6 +3375,7 @@ describe("doctor config flow", () => {
       expect(cfg.channels?.discord?.accounts?.alpha?.threadBindings?.ttlHours).toBeUndefined();
       expect(cfg.channels?.defaults?.heartbeat?.showOk).toBe(true);
       expect(cfg.channels?.defaults?.heartbeat?.showAlerts).toBe(false);
+      expect(result.shouldWriteConfig).toBe(true);
     },
   );
 
