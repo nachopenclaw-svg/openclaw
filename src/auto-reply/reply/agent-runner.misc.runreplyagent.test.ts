@@ -2782,7 +2782,7 @@ describe("runReplyAgent fallback reasoning tags", () => {
         updatedAt: Date.now(),
         totalTokens: 1_000_000,
         totalTokensFresh: true,
-        totalTokensVersion: 1,
+        totalTokensVersion: 1 as const,
         compactionCount: 0,
       },
     });

@@ -247,7 +247,7 @@ describe("forkSessionEntryFromParent", () => {
         sessionId: "parent-session",
         totalTokens: 150_000,
         totalTokensFresh: true,
-        totalTokensVersion: 1,
+        totalTokensVersion: 1 as const,
         updatedAt: 1,
       },
     );
