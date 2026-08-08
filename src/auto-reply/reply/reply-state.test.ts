@@ -344,18 +344,23 @@ describe("shouldRunMemoryFlush", () => {
     };
 
     for (const entry of [
-      { totalTokens: 95_000, totalTokensFresh: true, totalTokensVersion: 1, compactionCount: 1 },
       {
         totalTokens: 95_000,
         totalTokensFresh: true,
-        totalTokensVersion: 1,
+        totalTokensVersion: 1 as const,
+        compactionCount: 1,
+      },
+      {
+        totalTokens: 95_000,
+        totalTokensFresh: true,
+        totalTokensVersion: 1 as const,
         compactionCount: 2,
         memoryFlush: { kind: "succeeded" as const, compactionCount: 1 },
       },
       {
         totalTokens: 95_000,
         totalTokensFresh: true,
-        totalTokensVersion: 1,
+        totalTokensVersion: 1 as const,
         compactionCount: 3,
         memoryFlush: { kind: "succeeded" as const, compactionCount: 2 },
       },
