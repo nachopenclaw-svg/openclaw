@@ -159,12 +159,11 @@ export async function normalizeEmbeddedRunAttempt(input: {
           ]),
         )
       : input.bootstrapPromptWarningSignaturesSeen);
-  const lastAssistantUsage = normalizeAssistantUsageForContext(sessionLastAssistant);
-  const currentAttemptAssistantUsage = normalizeAssistantUsageForContext(currentAttemptAssistant);
+  const attemptAssistantUsage = normalizeAssistantUsageForContext(attemptAssistant);
   const promptCacheLastCallUsage = normalizeUsage(attempt.promptCache?.lastCallUsage as UsageLike);
   const callUsage = resolveLatestCallUsage({
-    currentAttemptCandidates: [currentAttemptAssistantUsage, promptCacheLastCallUsage],
-    carriedCandidates: [input.lastRunPromptUsage, lastAssistantUsage],
+    currentAttemptCandidates: [attemptAssistantUsage, promptCacheLastCallUsage],
+    carriedCandidates: [input.lastRunPromptUsage],
   });
   const attemptUsage = attempt.attemptUsage ?? callUsage.currentAttempt;
   mergeUsageIntoAccumulator(input.usageAccumulator, attemptUsage);
