@@ -230,7 +230,12 @@ function createSessionStatusRows() {
     >;
     const recent = Object.entries(store).map(([key, entry]) => {
       const contextTokens = typeof entry.contextTokens === "number" ? entry.contextTokens : null;
-      const total = typeof entry.totalTokens === "number" ? entry.totalTokens : null;
+      const total =
+        typeof entry.totalTokens === "number" &&
+        entry.totalTokensFresh === true &&
+        entry.totalTokensVersion === 1
+          ? entry.totalTokens
+          : null;
       return {
         agentId: agent.id,
         key,
@@ -1137,10 +1142,10 @@ describe("statusCommand", () => {
     runtimeLogMock.mockClear();
     await statusCommand({ json: true }, runtime as never);
     const payload = JSON.parse(getLastRuntimeLog());
-    expect(payload.sessions.recent[0].totalTokens).toBe(5000);
+    expect(payload.sessions.recent[0].totalTokens).toBeNull();
     expect(payload.sessions.recent[0].totalTokensFresh).toBe(false);
-    expect(payload.sessions.recent[0].percentUsed).toBe(50);
-    expect(payload.sessions.recent[0].remainingTokens).toBe(5000);
+    expect(payload.sessions.recent[0].percentUsed).toBeNull();
+    expect(payload.sessions.recent[0].remainingTokens).toBeNull();
   });
 
   it("prints formatted lines with verbose cache details", async () => {

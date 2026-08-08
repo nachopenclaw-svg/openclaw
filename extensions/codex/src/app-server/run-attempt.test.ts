@@ -643,10 +643,6 @@ function createRunParams() {
   return createParams(sessionFile, workspaceDir);
 }
 
-function openRunSession(sessionFile: string) {
-  return openFileBackedSessionManagerForTest(sessionFile, { sessionId: "session-1" });
-}
-
 const GOOGLE_CALENDAR_PLUGIN_CONFIG = {
   codexPlugins: {
     enabled: true,

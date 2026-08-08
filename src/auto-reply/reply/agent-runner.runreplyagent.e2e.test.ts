@@ -4800,6 +4800,7 @@ describe("runReplyAgent typing (heartbeat)", () => {
     const sessionEntry = makeSessionEntry({
       totalTokens: 42_000,
       totalTokensFresh: true,
+      totalTokensVersion: 1,
       fallbackNotice: {
         kind: "active",
         selectedModel: "anthropic/claude-opus-4-7",
@@ -4843,6 +4844,7 @@ describe("runReplyAgent typing (heartbeat)", () => {
     expect(stored.model).toBe("claude-opus-4-7");
     expect(stored.totalTokens).toBeUndefined();
     expect(stored.totalTokensFresh).toBe(false);
+    expect(stored.totalTokensVersion).toBeUndefined();
   });
 
   it("surfaces overflow fallback when embedded run returns empty payloads", async () => {
