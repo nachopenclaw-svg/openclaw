@@ -1,5 +1,6 @@
 import {
   createAssistantMessageEventStream,
+  type AssistantMessage,
   type Context,
   type Model,
   type SimpleStreamOptions,
@@ -26,6 +27,8 @@ import {
   testModel,
 } from "./agent-session-loop-correctness.test-support.js";
 import type { AgentSessionEvent } from "./agent-session-types.js";
+import type { AgentSession } from "./agent-session.js";
+import type { ToolDefinition } from "./extensions/types.js";
 import { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 
