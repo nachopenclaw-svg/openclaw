@@ -162,9 +162,17 @@ export async function normalizeEmbeddedRunAttempt(input: {
   const lastAssistantUsage = normalizeAssistantUsageForContext(sessionLastAssistant);
   const currentAttemptAssistantUsage = normalizeAssistantUsageForContext(currentAttemptAssistant);
   const promptCacheLastCallUsage = normalizeUsage(attempt.promptCache?.lastCallUsage as UsageLike);
+  // An unavailable-context sentinel on the session's latest assistant is an
+  // authoritative "no fresh fact" record (#120497). Carried usage from earlier
+  // attempts is older than that record, so scanning past the sentinel would
+  // revive a stale context-size fact across retries.
+  const latestAssistantContextUnavailable =
+    lastAssistantUsage?.contextUsage?.state === "unavailable";
   const callUsage = resolveLatestCallUsage({
     currentAttemptCandidates: [currentAttemptAssistantUsage, promptCacheLastCallUsage],
-    carriedCandidates: [input.lastRunPromptUsage, lastAssistantUsage],
+    carriedCandidates: latestAssistantContextUnavailable
+      ? [lastAssistantUsage]
+      : [input.lastRunPromptUsage, lastAssistantUsage],
   });
   const attemptUsage = attempt.attemptUsage ?? callUsage.currentAttempt;
   mergeUsageIntoAccumulator(input.usageAccumulator, attemptUsage);
