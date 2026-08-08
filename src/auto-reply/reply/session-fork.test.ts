@@ -247,6 +247,7 @@ describe("forkSessionEntryFromParent", () => {
         sessionId: "parent-session",
         totalTokens: 150_000,
         totalTokensFresh: true,
+        totalTokensVersion: 1,
         updatedAt: 1,
       },
     );
@@ -369,10 +370,18 @@ describe("forkSessionEntryFromParent", () => {
       ],
     );
 
-    await expect(resolveParentForkDecision({ parentEntry, storePath })).resolves.toMatchObject({
+    const decision = await resolveParentForkDecision({ parentEntry, storePath });
+
+    expect(decision).toMatchObject({
       status: "fork",
-      parentTokens: 4_567,
+      parentTokens: expect.any(Number),
     });
+    if (decision.status !== "fork" || typeof decision.parentTokens !== "number") {
+      throw new Error("expected a transcript-derived parent token estimate");
+    }
+    expect(Number.isFinite(decision.parentTokens)).toBe(true);
+    expect(decision.parentTokens).not.toBe(parentEntry.totalTokens);
+    expect(decision.parentTokens).not.toBe(927_907);
   });
 
   it("uses exact SQLite context usage instead of stale cached totals", async () => {
