@@ -164,7 +164,9 @@ export async function normalizeEmbeddedRunAttempt(input: {
   const promptCacheLastCallUsage = normalizeUsage(attempt.promptCache?.lastCallUsage as UsageLike);
   const callUsage = resolveLatestCallUsage({
     currentAttemptCandidates: [currentAttemptAssistantUsage, promptCacheLastCallUsage],
-    carriedCandidates: [input.lastRunPromptUsage, lastAssistantUsage],
+    // The persisted last assistant is the newest context fact. Its unavailable
+    // barrier must not let an older carried snapshot become authoritative again.
+    carriedCandidates: [lastAssistantUsage, input.lastRunPromptUsage],
   });
   const attemptUsage = attempt.attemptUsage ?? callUsage.currentAttempt;
   mergeUsageIntoAccumulator(input.usageAccumulator, attemptUsage);
