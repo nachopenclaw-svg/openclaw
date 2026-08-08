@@ -232,7 +232,7 @@ function createSessionStatusRows() {
       const contextTokens = typeof entry.contextTokens === "number" ? entry.contextTokens : null;
       const total =
         typeof entry.totalTokens === "number" &&
-        entry.totalTokensFresh === true &&
+        entry.totalTokensFresh &&
         entry.totalTokensVersion === 1
           ? entry.totalTokens
           : null;
