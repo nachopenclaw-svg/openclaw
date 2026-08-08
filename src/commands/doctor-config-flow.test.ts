@@ -3274,103 +3274,109 @@ describe("doctor config flow", () => {
     expect(toolsBySender["*"]).toEqual({ deny: ["exec"] });
   });
 
-  it("repairs legacy root runtime config surfaces in one pass", async () => {
-    const result = await runDoctorConfigWithInput({
-      repair: true,
-      config: {
-        heartbeat: {
-          model: "anthropic/claude-3-5-haiku-20241022",
-          every: "30m",
-          showOk: true,
-          showAlerts: false,
-        },
-        gateway: {
-          bind: "0.0.0.0",
-        },
-        session: {
-          threadBindings: {
-            ttlHours: 24,
+  it.each([
+    ["0.0.0.0", "lan"],
+    ["localhost", "loopback"],
+  ] as const)(
+    "repairs legacy root runtime config surfaces with gateway bind %s",
+    async (legacyBind, canonicalBind) => {
+      const result = await runDoctorConfigWithInput({
+        repair: true,
+        config: {
+          heartbeat: {
+            model: "anthropic/claude-3-5-haiku-20241022",
+            every: "30m",
+            showOk: true,
+            showAlerts: false,
           },
-        },
-        channels: {
-          discord: {
+          gateway: {
+            bind: legacyBind,
+          },
+          session: {
             threadBindings: {
-              ttlHours: 12,
+              ttlHours: 24,
             },
-            accounts: {
-              alpha: {
-                threadBindings: {
-                  ttlHours: 6,
+          },
+          channels: {
+            discord: {
+              threadBindings: {
+                ttlHours: 12,
+              },
+              accounts: {
+                alpha: {
+                  threadBindings: {
+                    ttlHours: 6,
+                  },
                 },
               },
             },
           },
         },
-      },
-      run: loadAndMaybeMigrateDoctorConfig,
-    });
+        run: loadAndMaybeMigrateDoctorConfig,
+      });
 
-    const cfg = result.cfg as {
-      heartbeat?: unknown;
-      gateway?: {
-        bind?: string;
-      };
-      session?: {
-        maintenance?: {
-          rotateBytes?: unknown;
+      const cfg = result.cfg as {
+        heartbeat?: unknown;
+        gateway?: {
+          bind?: string;
         };
-        threadBindings?: {
-          idleHours?: number;
-          ttlHours?: number;
-        };
-      };
-      agents?: {
-        defaults?: {
-          heartbeat?: {
-            model?: string;
-            every?: string;
+        session?: {
+          maintenance?: {
+            rotateBytes?: unknown;
           };
-        };
-      };
-      channels?: {
-        defaults?: {
-          heartbeat?: {
-            showOk?: boolean;
-            showAlerts?: boolean;
-            useIndicator?: boolean;
-          };
-        };
-        discord?: {
           threadBindings?: {
             idleHours?: number;
             ttlHours?: number;
           };
-          accounts?: Record<
-            string,
-            {
-              threadBindings?: {
-                idleHours?: number;
-                ttlHours?: number;
-              };
-            }
-          >;
+        };
+        agents?: {
+          defaults?: {
+            heartbeat?: {
+              model?: string;
+              every?: string;
+            };
+          };
+        };
+        channels?: {
+          defaults?: {
+            heartbeat?: {
+              showOk?: boolean;
+              showAlerts?: boolean;
+              useIndicator?: boolean;
+            };
+          };
+          discord?: {
+            threadBindings?: {
+              idleHours?: number;
+              ttlHours?: number;
+            };
+            accounts?: Record<
+              string,
+              {
+                threadBindings?: {
+                  idleHours?: number;
+                  ttlHours?: number;
+                };
+              }
+            >;
+          };
         };
       };
-    };
-    expect(cfg.heartbeat).toBeUndefined();
-    expect(cfg.agents?.defaults?.heartbeat?.model).toBe("anthropic/claude-3-5-haiku-20241022");
-    expect(cfg.agents?.defaults?.heartbeat?.every).toBe("30m");
-    expect(cfg.gateway?.bind).toBe("lan");
-    expect(cfg.session?.maintenance?.rotateBytes).toBeUndefined();
-    expect(cfg.session?.threadBindings?.idleHours).toBe(24);
-    expect(cfg.channels?.discord?.threadBindings?.idleHours).toBe(12);
-    expect(cfg.channels?.discord?.accounts?.alpha?.threadBindings?.idleHours).toBe(6);
-    expect(cfg.session?.threadBindings?.ttlHours).toBeUndefined();
-    expect(cfg.channels?.discord?.threadBindings?.ttlHours).toBeUndefined();
-    expect(cfg.channels?.discord?.accounts?.alpha?.threadBindings?.ttlHours).toBeUndefined();
-    expect(cfg.channels?.defaults?.heartbeat?.showOk).toBe(true);
-    expect(cfg.channels?.defaults?.heartbeat?.showAlerts).toBe(false);
-  });
+      expect(cfg.heartbeat).toBeUndefined();
+      expect(cfg.agents?.defaults?.heartbeat?.model).toBe("anthropic/claude-3-5-haiku-20241022");
+      expect(cfg.agents?.defaults?.heartbeat?.every).toBe("30m");
+      expect(cfg.gateway?.bind).toBe(canonicalBind);
+      expect(cfg.session?.maintenance?.rotateBytes).toBeUndefined();
+      expect(cfg.session?.threadBindings?.idleHours).toBe(24);
+      expect(cfg.channels?.discord?.threadBindings?.idleHours).toBe(12);
+      expect(cfg.channels?.discord?.accounts?.alpha?.threadBindings?.idleHours).toBe(6);
+      expect(cfg.session?.threadBindings?.ttlHours).toBeUndefined();
+      expect(cfg.channels?.discord?.threadBindings?.ttlHours).toBeUndefined();
+      expect(cfg.channels?.discord?.accounts?.alpha?.threadBindings?.ttlHours).toBeUndefined();
+      expect(cfg.channels?.defaults?.heartbeat?.showOk).toBe(true);
+      expect(cfg.channels?.defaults?.heartbeat?.showAlerts).toBe(false);
+    },
+  );
 
   it("warns clearly about legacy config surfaces and points to doctor --fix", async () => {
     const noteSpy = resetTerminalNoteMock();
