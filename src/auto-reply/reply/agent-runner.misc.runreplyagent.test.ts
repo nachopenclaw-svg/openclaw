@@ -558,7 +558,7 @@ describe("runReplyAgent auto-compaction token update", () => {
       updatedAt: Date.now(),
       totalTokens: 200_000,
       totalTokensFresh: true,
-      totalTokensVersion: 1,
+      totalTokensVersion: 1 as const,
     };
     await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
     compactState.compactEmbeddedAgentSessionMock.mockRejectedValueOnce(new GatewayDrainingError());
@@ -2782,7 +2782,7 @@ describe("runReplyAgent fallback reasoning tags", () => {
         updatedAt: Date.now(),
         totalTokens: 1_000_000,
         totalTokensFresh: true,
-        totalTokensVersion: 1,
+        totalTokensVersion: 1 as const,
         compactionCount: 0,
       },
     });
