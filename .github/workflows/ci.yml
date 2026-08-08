@@ -1718,7 +1718,7 @@ jobs:
               unset GH_TOKEN
               pnpm check:max-lines-ratchet --base "$base_ref"
               if [[ "${RATCHET_RELEASE_MERGE_TREE:-}" == "true" ]]; then
-                node scripts/run-oxlint.mjs src ui/src packages extensions
+                node scripts/run-oxlint-shards.mjs --only=core --only=extensions --split-core --threads=1
               fi
               ;;
             bun-launcher)
