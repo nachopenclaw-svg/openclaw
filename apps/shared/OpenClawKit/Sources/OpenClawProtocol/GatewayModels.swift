@@ -4822,6 +4822,7 @@ public struct SessionCompactionCheckpoint: Codable, Sendable {
     public let reason: AnyCodable
     public let tokensbefore: Int?
     public let tokensafter: Int?
+    public let tokensversion: Double?
     public let summary: String?
     public let firstkeptentryid: String?
     public let precompaction: [String: AnyCodable]
@@ -4835,6 +4836,7 @@ public struct SessionCompactionCheckpoint: Codable, Sendable {
         reason: AnyCodable,
         tokensbefore: Int? = nil,
         tokensafter: Int? = nil,
+        tokensversion: Double? = nil,
         summary: String? = nil,
         firstkeptentryid: String? = nil,
         precompaction: [String: AnyCodable],
@@ -4847,6 +4849,7 @@ public struct SessionCompactionCheckpoint: Codable, Sendable {
         self.reason = reason
         self.tokensbefore = tokensbefore
         self.tokensafter = tokensafter
+        self.tokensversion = tokensversion
         self.summary = summary
         self.firstkeptentryid = firstkeptentryid
         self.precompaction = precompaction
@@ -4861,6 +4864,7 @@ public struct SessionCompactionCheckpoint: Codable, Sendable {
         case reason
         case tokensbefore = "tokensBefore"
         case tokensafter = "tokensAfter"
+        case tokensversion = "tokensVersion"
         case summary
         case firstkeptentryid = "firstKeptEntryId"
         case precompaction = "preCompaction"
