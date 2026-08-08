@@ -164,7 +164,7 @@ export async function normalizeEmbeddedRunAttempt(input: {
   const promptCacheLastCallUsage = normalizeUsage(attempt.promptCache?.lastCallUsage as UsageLike);
   const callUsage = resolveLatestCallUsage({
     currentAttemptCandidates: [currentAttemptAssistantUsage, promptCacheLastCallUsage],
-    carriedCandidates: [input.lastRunPromptUsage, lastAssistantUsage],
+    carriedCandidates: [lastAssistantUsage, input.lastRunPromptUsage],
   });
   const attemptUsage = attempt.attemptUsage ?? callUsage.currentAttempt;
   mergeUsageIntoAccumulator(input.usageAccumulator, attemptUsage);
