@@ -3,12 +3,14 @@ import fs from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readConfigFileSnapshot } from "../config/config.js";
 import { withTempHome, writeOpenClawConfig } from "../config/test-helpers.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { runInitialConfigWriteHealth } from "../flows/doctor-health-contribution-runners.config.js";
 import type { DoctorHealthFlowContext } from "../flows/doctor-health-contribution-types.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
-import { loadAndMaybeMigrateDoctorConfig } from "./doctor-config-flow.js";
 import { createDoctorPrompter, type DoctorOptions } from "./doctor-prompter.js";
+import { normalizeCompatibilityConfigValues } from "./doctor/shared/legacy-config-core-migrate.js";
+import { migrateLegacyConfig } from "./doctor/shared/legacy-config-migrate.js";
 
 describe("Doctor gateway bind persistence", () => {
   afterEach(() => {
@@ -20,9 +22,22 @@ describe("Doctor gateway bind persistence", () => {
     ["0.0.0.0", "lan"],
   ] as const)("persists gateway bind %s as %s", async (legacyBind, canonicalBind) => {
     await withTempHome(async (home) => {
-      const configPath = await writeOpenClawConfig(home, {
+      const originalConfig = {
         gateway: { mode: "local", bind: legacyBind },
+      } as unknown as OpenClawConfig;
+      const configPath = await writeOpenClawConfig(home, originalConfig);
+      const legacyMigration = migrateLegacyConfig(originalConfig);
+      if (!legacyMigration.config) {
+        throw new Error("expected legacy gateway bind migration");
+      }
+      const migrated = normalizeCompatibilityConfigValues(legacyMigration.config, {
+        sourceRaw: originalConfig,
       });
+      expect(migrated.config.gateway?.bind).toBe(canonicalBind);
+      expect([...legacyMigration.changes, ...migrated.changes]).toContain(
+        `Normalized gateway.bind "${legacyBind}" → "${canonicalBind}".`,
+      );
+
       const runtime: RuntimeEnv = {
         error: vi.fn(),
         exit: vi.fn(),
@@ -30,28 +45,15 @@ describe("Doctor gateway bind persistence", () => {
       };
       const options: DoctorOptions = { nonInteractive: true, repair: true };
       const prompter = createDoctorPrompter({ runtime, options });
-      const configResult = await loadAndMaybeMigrateDoctorConfig({
-        options,
-        confirm: (params) => prompter.confirm(params),
-        runtime,
-        prompter,
-      });
       const ctx: DoctorHealthFlowContext = {
         runtime,
         options,
         prompter,
-        configResult,
-        cfg: configResult.cfg,
-        cfgForPersistence: structuredClone(configResult.cfg),
-        sourceConfigValid: configResult.sourceConfigValid ?? true,
+        configResult: { cfg: migrated.config, shouldWriteConfig: true },
+        cfg: migrated.config,
+        cfgForPersistence: originalConfig,
+        sourceConfigValid: true,
         configPath,
-        stateDirExistedAtStart: true,
-        ...(configResult.runWithPluginMetadataSnapshot
-          ? { runWithPluginMetadataSnapshot: configResult.runWithPluginMetadataSnapshot }
-          : {}),
-        ...(configResult.invalidatePluginMetadataSnapshot
-          ? { invalidatePluginMetadataSnapshot: configResult.invalidatePluginMetadataSnapshot }
-          : {}),
       };
 
       await runInitialConfigWriteHealth(ctx);
