@@ -195,9 +195,12 @@ export function resolveLatestCallUsage(params: {
   latest: NormalizedUsage | undefined;
 } {
   const currentAttempt = params.currentAttemptCandidates.find(hasNonzeroUsage);
+  const carriedUnavailable = params.carriedCandidates.find(
+    (candidate) => candidate?.contextUsage?.state === "unavailable",
+  );
   return {
     currentAttempt,
-    latest: currentAttempt ?? params.carriedCandidates.find(hasNonzeroUsage),
+    latest: currentAttempt ?? carriedUnavailable ?? params.carriedCandidates.find(hasNonzeroUsage),
   };
 }
 

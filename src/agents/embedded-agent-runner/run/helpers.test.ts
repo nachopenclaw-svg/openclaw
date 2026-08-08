@@ -214,6 +214,34 @@ describe("resolveLatestCallUsage", () => {
       latest,
     });
   });
+
+  it("treats carried unavailable usage as a barrier to stale nonzero usage", () => {
+    const unavailable = { contextUsage: { state: "unavailable" as const } };
+
+    expect(
+      resolveLatestCallUsage({
+        currentAttemptCandidates: [{ input: 0, output: 0, total: 0 }],
+        carriedCandidates: [{ input: 42_000, output: 1_000, total: 43_000 }, unavailable],
+      }),
+    ).toEqual({
+      currentAttempt: undefined,
+      latest: unavailable,
+    });
+  });
+
+  it("keeps current-attempt usage ahead of a carried unavailable barrier", () => {
+    const current = { input: 20, output: 4, total: 24 };
+
+    expect(
+      resolveLatestCallUsage({
+        currentAttemptCandidates: [current],
+        carriedCandidates: [{ contextUsage: { state: "unavailable" } }],
+      }),
+    ).toEqual({
+      currentAttempt: current,
+      latest: current,
+    });
+  });
 });
 
 describe("buildUsageAgentMetaFields", () => {
